@@ -1,13 +1,20 @@
 'use strict';
 
 const functions = require('firebase-functions');
-const { Storage } = require('@google-cloud/storage');
+// const { Storage } = require('@google-cloud/storage');
+// const gcs = new Storage();
+const admin = require('firebase-admin');
+admin.initializeApp();
 const spawn = require('child-process-promise').spawn;
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
 
-const gcs = new Storage();
+// Max height and width of the thumbnail in pixels.
+const THUMB_MAX_HEIGHT = 200;
+const THUMB_MAX_WIDTH = 200;
+// Thumbnail prefix added to file names.
+const THUMB_PREFIX = 'thumb_';
 
 exports.helloWorld = functions.https.onRequest((request, response) => {
   response.send('Hello from Firebase!');
@@ -16,10 +23,12 @@ exports.helloWorld = functions.https.onRequest((request, response) => {
 exports.generateThumbnail = functions.storage
   .object()
   .onFinalize(async (object) => {
-    const fileBucket = object.bucket;
-    const filePath = object.name;
-    const contentType = object.contentType;
-    const metageneration = object.metageneration;
+    // source file
+    const filePath = object.name; // folder/file.jpg
+    const fileName = path.basename(filePath); // file.jpg
+    const fileDir = path.dirname(filePath); // folder
+    const contentType = object.contentType; // image/jpeg
+    const metageneration = object.metageneration; // 1
 
     if (!contentType.startsWith('image/')) {
       console.log('This is not an image.');
@@ -31,36 +40,45 @@ exports.generateThumbnail = functions.storage
       return null;
     }
 
-    const fileName = path.basename(filePath);
-    if (fileName.startsWith('thumb_')) {
+    if (fileName.startsWith(THUMB_PREFIX)) {
       console.log('Image is already a thumbnail.');
       return null;
     }
 
-    const bucket = gcs.bucket(fileBucket);
-    const tempFilePath = path.join(os.tmpdir(), fileName);
+    // Cloud Storage
+    const fileBucket = object.bucket; // project.appspot.com
+    const bucket = admin.storage().bucket(fileBucket); // Bucket { ... }
+    const sourceFile = bucket.file(filePath); // File { ... }
+
+    // temporary local files
+    const tempSourceFilePath = path.join(os.tmpdir(), fileName); // /tmp/file.jpg
+    const thumbFileName = `${THUMB_PREFIX}${fileName}`; // thumb_file.jpg
+    const tempThumbFilePath = path.join(os.tmpdir(), thumbFileName); // /tmp/thumb_file.jpg
+
+    // download source and create thumbnail
+    await sourceFile.download({ destination: tempSourceFilePath });
+    await spawn(
+      'convert',
+      [
+        tempSourceFilePath,
+        '-thumbnail',
+        `${THUMB_MAX_WIDTH}x${THUMB_MAX_HEIGHT}>`,
+        tempThumbFilePath
+      ],
+      { capture: ['stdout', 'stderr'] }
+    );
+
+    // target file - thumbnail
+    const thumbFilePath = path.join(fileDir, thumbFileName); // folder/thumb_file.jpg
     const metadata = {
       contentType: contentType
     };
-
-    await bucket.file(filePath).download({ destination: tempFilePath });
-    console.log('Image downloaded locally to - ', tempFilePath);
-
-    await spawn('convert', [
-      tempFilePath,
-      '-thumbnail',
-      '200x200>',
-      tempFilePath
-    ]);
-    console.log('Thumbnail created at - ', tempFilePath);
-
-    const thumbFileName = `thumb_${fileName}`;
-    const thumbFilePath = path.join(path.dirname(filePath), thumbFileName);
-    await bucket.upload(tempFilePath, {
+    await bucket.upload(tempThumbFilePath, {
       destination: thumbFilePath,
       metadata: metadata
     });
 
-    fs.unlinkSync(tempFilePath);
-    return console.log('Cleanup successful');
+    fs.unlinkSync(tempSourceFilePath);
+    fs.unlinkSync(tempThumbFilePath);
+    return console.log('Thumbnail created, cleanup successful');
   });
